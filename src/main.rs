@@ -1,4 +1,4 @@
-use std::{collections::HashSet, io::Write};
+use std::{collections::HashSet, io::Write, iter};
 
 use chrono::DateTime;
 use clap::{Parser, Subcommand, Args};
@@ -102,6 +102,11 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             // Download
             download(entries_to_download.into_iter().map(|t| t.0), false)?;
         },
+        CliCommand::Install(item_id) => {
+            let item_id = item_id.id.to_string();
+            let client = SteamWebApiClient::new(config.steam_webapi_key);
+            install_latest(client, iter::once(item_id)).await?;
+        }
         CliCommand::Export(file) => {
             let hm = command::get_local_descriptors()?;
             let empty = hm.is_empty();
@@ -128,91 +133,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             println!("Done");
         },
         CliCommand::Update => {
-            // fetch remote metadata for all locally present mods
+            // same as install but do for all present local items
             let local_descriptors = command::get_local_descriptors()?;
-            let file_ids = local_descriptors.keys().cloned().collect::<HashSet<_>>();
+            let item_ids = local_descriptors.into_keys();
+
             let client = SteamWebApiClient::new(config.steam_webapi_key);
-            let workshop_details = command::fetch_workshop_details_with_dependencies(&client, file_ids).await?;
-
-            let mut ids_with_error = vec![];
-            let mut ids_to_download = vec![];
-            let mut ids_to_ignore = vec![];
-
-            for (id, response) in workshop_details.iter() {
-                match response {
-                    schemas::GetPublishedFileDetailsResponseItem::FileDetails(fd) => {
-                        let remote_ts = DateTime::from_timestamp(fd.time_updated, 0)
-                            .ok_or(Error::Internal("error constructing timestamp".to_owned()))?;
-                        // desired state is all fetched entries. Compare with local descriptor if present
-                        match command::get_local_created_timestamp(&id)? {
-                            Some(local_ts) => {
-                                if remote_ts > local_ts {
-                                    // remote is newer than local, should download
-                                    ids_to_download.push((id.clone(), fd, remote_ts, Some(local_ts)));
-                                } else {
-                                    // remote is older than local, no need to update
-                                    ids_to_ignore.push((id.clone(), fd));
-                                }
-                            }
-                            None => {
-                                // no local version, should download
-                                ids_to_download.push((id.clone(), fd, remote_ts, None));
-                            }
-                        }
-                    },
-                    schemas::GetPublishedFileDetailsResponseItem::MissingItem { .. }=> {
-                        ids_with_error.push(id.clone());
-                    }
-                }
-            }
-
-            if !ids_with_error.is_empty() {
-                println!("Error with checking updates for items with ids:");
-                for id in ids_with_error {
-                    println!("  {}", id);
-                }
-            }
-
-            if ids_to_download.is_empty() {
-                println!("All items up-to-date, nothing to do");
-                return Ok(())
-            }
-
-            ids_to_download.sort_unstable_by_key(|(_, fd, _, _)| fd.title.to_lowercase());
-            ids_to_ignore.sort_unstable_by_key(|(_, fd)| fd.title.to_lowercase());
-
-            println!("Items up-to-date:");
-            for (_, details) in ids_to_ignore.iter() {
-                println!("  {}", &details.title);
-            }
-            println!();
-
-            println!("Items to be downloaded:");
-            println!("{:-^48}|{:-^21}|{:-^21}", "Name", "Latest", "Current");
-            for (_, details, remote_ts, local_ts) in ids_to_download.iter() {
-                let remote_ts = remote_ts.format("%F %X");
-                let local_ts = local_ts.map_or("<none>".to_owned(), |ts| ts.format("%F %X").to_string());
-                println!("  {:<45}   {}   {}", &details.title, remote_ts, local_ts);
-            }
-            println!();
-
-            print!("Confirm? [Y/n] ");
-            std::io::stdout().flush()?;
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
-            if !input.trim().is_empty() && input.trim().to_lowercase() != "y" {
-                println!("Aborting");
-                return Ok(())
-            }
-
-            // massage into old mods format
-            let entries_to_download = ids_to_download.into_iter().map(|(id, details, _, _)| Mod {
-                id: id.clone(),
-                name: Some(details.title.clone()),
-                checksum: None,
-            });
-
-            download(entries_to_download, true)?;
+            install_latest(client, item_ids).await?;
         },
         CliCommand::Cleanup => {
             println!("Clearing steamcmd workshop cache");
@@ -222,6 +148,90 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+async fn install_latest(client: SteamWebApiClient, item_ids: impl Iterator<Item = String>) -> Result<()> {
+    let workshop_details = command::fetch_workshop_details_with_dependencies(&client, item_ids).await?;
+
+    let mut ids_with_error = vec![];
+    let mut ids_to_download = vec![];
+    let mut ids_to_ignore = vec![];
+
+    for (id, response) in workshop_details.iter() {
+        match response {
+            schemas::GetPublishedFileDetailsResponseItem::FileDetails(fd) => {
+                let remote_ts = DateTime::from_timestamp(fd.time_updated, 0)
+                    .ok_or(Error::Internal("error constructing timestamp".to_owned()))?;
+                // desired state is all fetched entries. Compare with local descriptor if present
+                match command::get_local_created_timestamp(&id)? {
+                    Some(local_ts) => {
+                        if remote_ts > local_ts {
+                            // remote is newer than local, should download
+                            ids_to_download.push((id.clone(), fd, remote_ts, Some(local_ts)));
+                        } else {
+                            // remote is older than local, no need to update
+                            ids_to_ignore.push((id.clone(), fd));
+                        }
+                    }
+                    None => {
+                        // no local version, should download
+                        ids_to_download.push((id.clone(), fd, remote_ts, None));
+                    }
+                }
+            },
+            schemas::GetPublishedFileDetailsResponseItem::MissingItem { .. }=> {
+                ids_with_error.push(id.clone());
+            }
+        }
+    }
+
+    if !ids_with_error.is_empty() {
+        println!("Error with checking items with ids:");
+        for id in ids_with_error {
+            println!("  {}", id);
+        }
+    }
+
+    if ids_to_download.is_empty() {
+        println!("All items up-to-date, nothing to do");
+        return Ok(())
+    }
+
+    ids_to_download.sort_unstable_by_key(|(_, fd, _, _)| fd.title.to_lowercase());
+    ids_to_ignore.sort_unstable_by_key(|(_, fd)| fd.title.to_lowercase());
+
+    println!("Items up-to-date:");
+    for (_, details) in ids_to_ignore.iter() {
+        println!("  {}", &details.title);
+    }
+    println!();
+
+    println!("Items to be downloaded:");
+    println!("{:-^48}|{:-^21}|{:-^21}", "Name", "Latest", "Current");
+    for (_, details, remote_ts, local_ts) in ids_to_download.iter() {
+        let remote_ts = remote_ts.format("%F %X");
+        let local_ts = local_ts.map_or("<none>".to_owned(), |ts| ts.format("%F %X").to_string());
+        println!("  {:<45}   {}   {}", &details.title, remote_ts, local_ts);
+    }
+    println!();
+
+    print!("Confirm? [Y/n] ");
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    if !input.trim().is_empty() && input.trim().to_lowercase() != "y" {
+        println!("Aborting");
+        return Ok(())
+    }
+
+    // massage into old mods format
+    let entries_to_download = ids_to_download.into_iter().map(|(id, details, _, _)| Mod {
+        id: id.clone(),
+        name: Some(details.title.clone()),
+        checksum: None,
+    });
+
+    download(entries_to_download, true)
 }
 
 fn download(entries_to_download: impl Iterator<Item = Mod>, ignore_checksum: bool) -> Result<()> {
@@ -276,6 +286,7 @@ struct Cli {
 enum CliCommand {
     Init,
     Import(FileArg),
+    Install(ItemId),
     Export(FileArg),
     Update,
     Cleanup,
@@ -284,4 +295,9 @@ enum CliCommand {
 #[derive(Args)]
 struct FileArg {
     file: String,
+}
+
+#[derive(Args)]
+struct ItemId {
+    id: u32,
 }

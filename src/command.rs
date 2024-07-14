@@ -176,9 +176,9 @@ pub fn get_config_or_default() -> Result<Config> {
 }
 
 /// Given a list of workshop file ids, fetch all details for files including dependencies
-pub async fn fetch_workshop_details_with_dependencies(webapi_client: &SteamWebApiClient, file_ids: HashSet<String>) -> Result<HashMap<String, GetPublishedFileDetailsResponseItem>> {
+pub async fn fetch_workshop_details_with_dependencies(webapi_client: &SteamWebApiClient, file_ids: impl Iterator<Item = String>) -> Result<HashMap<String, GetPublishedFileDetailsResponseItem>> {
     let mut cached_file_details = HashMap::new();
-    let mut new_file_ids = file_ids;
+    let mut new_file_ids = HashSet::from_iter(file_ids);
     loop {
         if new_file_ids.is_empty() {
             break;
