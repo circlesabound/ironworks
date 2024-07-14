@@ -37,10 +37,17 @@ pub struct GetPublishedFileDetailsResponse {
 
 #[derive(Deserialize)]
 pub struct GetPublishedFileDetailsResponseInner {
-    pub publishedfiledetails: Vec<PublishedFileDetails>,
+    pub publishedfiledetails: Vec<GetPublishedFileDetailsResponseItem>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+pub enum GetPublishedFileDetailsResponseItem {
+    FileDetails(PublishedFileDetails),
+    MissingItem { result: i32, publishedfileid: String }
+}
+
+#[derive(Deserialize, Clone)]
 pub struct PublishedFileDetails {
     pub publishedfileid: String,
     pub title: String,
@@ -49,7 +56,7 @@ pub struct PublishedFileDetails {
     pub children: Option<Vec<PublishedFileChild>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct PublishedFileChild {
     pub publishedfileid: String,
 }

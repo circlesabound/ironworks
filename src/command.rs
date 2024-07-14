@@ -4,12 +4,13 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use curl::easy::Easy;
 use fs_extra::dir::CopyOptions;
+use itertools::Itertools;
 use log::{trace, error, warn};
 use ring::digest;
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
-use crate::{error::{Error, Result}, schemas::{Config, Descriptor, PublishedFileDetails}, steam_webapi_client::SteamWebApiClient};
+use crate::{error::{Error, Result}, schemas::{Config, Descriptor, GetPublishedFileDetailsResponseItem, PublishedFileDetails}, steam_webapi_client::SteamWebApiClient};
 
 pub fn install_irony() -> Result<()> {
     let url = "https://github.com/bcssov/IronyModManager/releases/latest/download/win-x64.zip";
@@ -175,7 +176,7 @@ pub fn get_config_or_default() -> Result<Config> {
 }
 
 /// Given a list of workshop file ids, fetch all details for files including dependencies
-pub async fn fetch_workshop_details_with_dependencies(webapi_client: &SteamWebApiClient, file_ids: HashSet<String>) -> Result<HashMap<String, PublishedFileDetails>> {
+pub async fn fetch_workshop_details_with_dependencies(webapi_client: &SteamWebApiClient, file_ids: HashSet<String>) -> Result<HashMap<String, GetPublishedFileDetailsResponseItem>> {
     let mut cached_file_details = HashMap::new();
     let mut new_file_ids = file_ids;
     loop {
@@ -183,18 +184,33 @@ pub async fn fetch_workshop_details_with_dependencies(webapi_client: &SteamWebAp
             break;
         }
 
-        let new_file_details = webapi_client.get_published_file_details(new_file_ids.iter()).await?;
+        let mut child_ids = HashSet::new();
 
-        // extract all currently uncached child ids from the new file details
-        new_file_ids = new_file_details.values()
-            .filter(|d| d.children.is_some())
-            .flat_map(|d| d.children.as_ref().unwrap())
-            .map(|c| c.publishedfileid.clone())
-            .filter(|id| !cached_file_details.contains_key(id))
-            .collect::<HashSet<_>>();
+        // manual pagination to help isolate issues
+        for chunk in &new_file_ids.iter().chunks(5) {
+            let new_file_details = webapi_client.get_published_file_details(chunk).await?;
 
-        // append new file details into cache
-        cached_file_details.extend(new_file_details.into_iter());
+            // extract all currently uncached child ids from the new file details
+            let new_child_ids = new_file_details.values()
+                .filter_map(|resp_item| {
+                    match resp_item {
+                        crate::schemas::GetPublishedFileDetailsResponseItem::FileDetails(fd) => Some(fd),
+                        _ => None,
+                    }
+                })
+                .filter(|d| d.children.is_some())
+                .flat_map(|d| d.children.as_ref().unwrap())
+                .map(|c| c.publishedfileid.clone())
+                .filter(|id| !cached_file_details.contains_key(id))
+                .collect::<HashSet<_>>();
+            child_ids.extend(new_child_ids);
+
+            // append new file details into cache
+            cached_file_details.extend(new_file_details.into_iter());
+        }
+
+        // repeat by fetching new child dependencies
+        new_file_ids = child_ids;
     }
     Ok(cached_file_details)
 }

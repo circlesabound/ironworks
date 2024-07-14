@@ -11,6 +11,7 @@ pub enum Error {
     FsExtra(fs_extra::error::Error),
     Io(std::io::Error),
     Jomini(jomini::Error),
+    Json(serde_json::Error),
     Reqwest(reqwest::Error),
     TomlDe(toml::de::Error),
     TomlSer(toml::ser::Error),
@@ -52,6 +53,12 @@ impl From<std::io::Error> for Error {
 impl From<jomini::Error> for Error {
     fn from(value: jomini::Error) -> Self {
         Error::Jomini(value)
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(value: serde_json::Error) -> Self {
+        Error::Json(value)
     }
 }
 

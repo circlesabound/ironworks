@@ -134,27 +134,42 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             let client = SteamWebApiClient::new(config.steam_webapi_key);
             let workshop_details = command::fetch_workshop_details_with_dependencies(&client, file_ids).await?;
 
+            let mut ids_with_error = vec![];
             let mut ids_to_download = vec![];
             let mut ids_to_ignore = vec![];
 
-            for (id, remote_details) in workshop_details.iter() {
-                let remote_ts = DateTime::from_timestamp(remote_details.time_updated, 0)
-                    .ok_or(Error::Internal("error constructing timestamp".to_owned()))?;
-                // desired state is all fetched entries. Compare with local descriptor if present
-                match command::get_local_created_timestamp(&id)? {
-                    Some(local_ts) => {
-                        if remote_ts > local_ts {
-                            // remote is newer than local, should download
-                            ids_to_download.push((id.clone(), remote_ts, Some(local_ts)));
-                        } else {
-                            // remote is older than local, no need to update
-                            ids_to_ignore.push(id.clone());
+            for (id, response) in workshop_details.iter() {
+                match response {
+                    schemas::GetPublishedFileDetailsResponseItem::FileDetails(fd) => {
+                        let remote_ts = DateTime::from_timestamp(fd.time_updated, 0)
+                            .ok_or(Error::Internal("error constructing timestamp".to_owned()))?;
+                        // desired state is all fetched entries. Compare with local descriptor if present
+                        match command::get_local_created_timestamp(&id)? {
+                            Some(local_ts) => {
+                                if remote_ts > local_ts {
+                                    // remote is newer than local, should download
+                                    ids_to_download.push((id.clone(), fd, remote_ts, Some(local_ts)));
+                                } else {
+                                    // remote is older than local, no need to update
+                                    ids_to_ignore.push((id.clone(), fd));
+                                }
+                            }
+                            None => {
+                                // no local version, should download
+                                ids_to_download.push((id.clone(), fd, remote_ts, None));
+                            }
                         }
+                    },
+                    schemas::GetPublishedFileDetailsResponseItem::MissingItem { .. }=> {
+                        ids_with_error.push(id.clone());
                     }
-                    None => {
-                        // no local version, should download
-                        ids_to_download.push((id.clone(), remote_ts, None));
-                    }
+                }
+            }
+
+            if !ids_with_error.is_empty() {
+                println!("Error with checking updates for items with ids:");
+                for id in ids_with_error {
+                    println!("  {}", id);
                 }
             }
 
@@ -163,23 +178,21 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 return Ok(())
             }
 
-            ids_to_download.sort_unstable_by_key(|(k, _, _)| k.to_lowercase());
-            ids_to_ignore.sort_unstable_by_key(|k| k.to_lowercase());
+            ids_to_download.sort_unstable_by_key(|(_, fd, _, _)| fd.title.to_lowercase());
+            ids_to_ignore.sort_unstable_by_key(|(_, fd)| fd.title.to_lowercase());
 
             println!("Items up-to-date:");
-            for id in ids_to_ignore.iter() {
-                let name = &workshop_details[id].title;
-                println!("  {}", name);
+            for (_, details) in ids_to_ignore.iter() {
+                println!("  {}", &details.title);
             }
             println!();
 
             println!("Items to be downloaded:");
             println!("{:-^48}|{:-^21}|{:-^21}", "Name", "Latest", "Current");
-            for (id, remote_ts, local_ts) in ids_to_download.iter() {
-                let name = &workshop_details[id].title;
+            for (_, details, remote_ts, local_ts) in ids_to_download.iter() {
                 let remote_ts = remote_ts.format("%F %X");
                 let local_ts = local_ts.map_or("<none>".to_owned(), |ts| ts.format("%F %X").to_string());
-                println!("  {:<45}   {}   {}", name, remote_ts, local_ts);
+                println!("  {:<45}   {}   {}", &details.title, remote_ts, local_ts);
             }
             println!();
 
@@ -193,9 +206,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
 
             // massage into old mods format
-            let entries_to_download = ids_to_download.into_iter().map(|(id, _, _)| Mod {
+            let entries_to_download = ids_to_download.into_iter().map(|(id, details, _, _)| Mod {
                 id: id.clone(),
-                name: Some(workshop_details[&id].title.clone()),
+                name: Some(details.title.clone()),
                 checksum: None,
             });
 
