@@ -1,21 +1,26 @@
-use std::io::Write;
+use std::{collections::HashSet, io::Write};
 
+use chrono::DateTime;
 use clap::{Parser, Subcommand, Args};
-use log::info;
+use error::{Error, Result};
+use log::{error, info};
 use schemas::{Manifest, Mod};
+use steam_webapi_client::SteamWebApiClient;
 
 mod command;
 mod error;
 mod schemas;
+mod steam_webapi_client;
 mod ui;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     if std::env::var_os("RUST_LOG").is_none() {
         std::env::set_var("RUST_LOG", "warn");
     }
     pretty_env_logger::init();
 
-    command::get_config_or_default()?;
+    let config = command::get_config_or_default()?;
 
     let cli = Cli::parse();
 
@@ -95,38 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Download
-            let mut errors = 0;
-            for entry in entries_to_download {
-                let entry = entry.0;
-                println!("Downloading \"{}\" ({}) ...", entry.name.unwrap_or("<no name>".to_owned()), entry.id);
-                let mut download = command::download_workshop_item(&entry.id)?;
-                let lines = download.take_output().into_iter();
-                std::thread::spawn(move || {
-                    for line in lines {
-                        info!("{}", line);
-                    }
-                });
-                download.wait()?;
-                println!("Download complete, copying to output ...");
-                command::copy_downloaded_workshop_item(&entry.id)?;
-                println!("Copied to output, computing checksum ...");
-                let checksum = command::calculate_local_checksum(&entry.id)?.expect("dir should exist");
-                println!("Checksum is {}", checksum);
-                if let Some(import_cs) = entry.checksum {
-                    if checksum == import_cs {
-                        println!("OK, match with import checksum");
-                    } else {
-                        println!("ERROR, checksum mismatch - {} local <=> import {}", checksum, import_cs);
-                        errors += 1;
-                    }
-                }
-            }
-
-            if errors != 0 {
-                println!("Done with {} errors", errors);
-            } else {
-                println!("Done");
-            }
+            download(entries_to_download.into_iter().map(|t| t.0), false)?;
         },
         CliCommand::Export(file) => {
             let hm = command::get_local_descriptors()?;
@@ -143,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     checksum: Some(command::calculate_local_checksum(id)?.expect("dir should exist"))
                 });
             }
-            mods.sort_unstable_by_key(|m| m.id.clone());
+            mods.sort_unstable_by_key(|m| m.id.to_lowercase());
 
             let manifest = Manifest {
                 mods,
@@ -153,11 +127,127 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::fs::write(file.file, manifest_str)?;
             println!("Done");
         },
+        CliCommand::Update => {
+            // fetch remote metadata for all locally present mods
+            let local_descriptors = command::get_local_descriptors()?;
+            let file_ids = local_descriptors.keys().cloned().collect::<HashSet<_>>();
+            let client = SteamWebApiClient::new(config.steam_webapi_key);
+            let workshop_details = command::fetch_workshop_details_with_dependencies(&client, file_ids).await?;
+
+            let mut ids_to_download = vec![];
+            let mut ids_to_ignore = vec![];
+
+            for (id, remote_details) in workshop_details.iter() {
+                let remote_ts = DateTime::from_timestamp(remote_details.time_updated, 0)
+                    .ok_or(Error::Internal("error constructing timestamp".to_owned()))?;
+                // desired state is all fetched entries. Compare with local descriptor if present
+                match command::get_local_created_timestamp(&id)? {
+                    Some(local_ts) => {
+                        if remote_ts > local_ts {
+                            // remote is newer than local, should download
+                            ids_to_download.push((id.clone(), remote_ts, Some(local_ts)));
+                        } else {
+                            // remote is older than local, no need to update
+                            ids_to_ignore.push(id.clone());
+                        }
+                    }
+                    None => {
+                        // no local version, should download
+                        ids_to_download.push((id.clone(), remote_ts, None));
+                    }
+                }
+            }
+
+            if ids_to_download.is_empty() {
+                println!("All items up-to-date, nothing to do");
+                return Ok(())
+            }
+
+            ids_to_download.sort_unstable_by_key(|(k, _, _)| k.to_lowercase());
+            ids_to_ignore.sort_unstable_by_key(|k| k.to_lowercase());
+
+            println!("Items up-to-date:");
+            for id in ids_to_ignore.iter() {
+                let name = &workshop_details[id].title;
+                println!("  {}", name);
+            }
+            println!();
+
+            println!("Items to be downloaded:");
+            println!("{:-^48}|{:-^21}|{:-^21}", "Name", "Latest", "Current");
+            for (id, remote_ts, local_ts) in ids_to_download.iter() {
+                let name = &workshop_details[id].title;
+                let remote_ts = remote_ts.format("%F %X");
+                let local_ts = local_ts.map_or("<none>".to_owned(), |ts| ts.format("%F %X").to_string());
+                println!("  {:<45}   {}   {}", name, remote_ts, local_ts);
+            }
+            println!();
+
+            print!("Confirm? [Y/n] ");
+            std::io::stdout().flush()?;
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input)?;
+            if !input.trim().is_empty() && input.trim().to_lowercase() != "y" {
+                println!("Aborting");
+                return Ok(())
+            }
+
+            // massage into old mods format
+            let entries_to_download = ids_to_download.into_iter().map(|(id, _, _)| Mod {
+                id: id.clone(),
+                name: Some(workshop_details[&id].title.clone()),
+                checksum: None,
+            });
+
+            download(entries_to_download, true)?;
+        },
         CliCommand::Cleanup => {
             println!("Clearing steamcmd workshop cache");
             command::purge_download_cache()?;
             println!("Done");
         },
+    }
+
+    Ok(())
+}
+
+fn download(entries_to_download: impl Iterator<Item = Mod>, ignore_checksum: bool) -> Result<()> {
+    let mut errors = 0;
+    for entry in entries_to_download {
+        println!("Downloading \"{}\" ({}) ...", entry.name.unwrap_or("<no name>".to_owned()), entry.id);
+        let mut download = command::download_workshop_item(&entry.id)?;
+        let lines = download.take_output().into_iter();
+        std::thread::spawn(move || {
+            for line in lines {
+                info!("{}", line);
+            }
+        });
+        if let Err(e) = download.wait() {
+            error!("Download failed with error: {:?}", e);
+            errors += 1;
+            continue;
+        }
+        println!("Download complete, copying to output ...");
+        command::copy_downloaded_workshop_item(&entry.id)?;
+        if !ignore_checksum {
+            println!("Copied to output, computing checksum ...");
+            let checksum = command::calculate_local_checksum(&entry.id)?.expect("dir should exist");
+            println!("Checksum is {}", checksum);
+            if let Some(import_cs) = entry.checksum {
+                if checksum == import_cs {
+                    println!("OK, match with import checksum");
+                } else {
+                    println!("ERROR, checksum mismatch - {} local <=> import {}", checksum, import_cs);
+                    errors += 1;
+                }
+            }
+        }
+    }
+
+    if errors != 0 {
+        println!("Done with {} errors", errors);
+    } else {
+        println!("Done");
     }
 
     Ok(())
@@ -174,6 +264,7 @@ enum CliCommand {
     Init,
     Import(FileArg),
     Export(FileArg),
+    Update,
     Cleanup,
 }
 

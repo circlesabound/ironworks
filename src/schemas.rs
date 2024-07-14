@@ -27,4 +27,29 @@ pub struct Descriptor {
 #[derive(Deserialize, Serialize)]
 pub struct Config {
     pub collection_path: String,
+    pub steam_webapi_key: String,
+}
+
+#[derive(Deserialize)]
+pub struct GetPublishedFileDetailsResponse {
+    pub response: GetPublishedFileDetailsResponseInner,
+}
+
+#[derive(Deserialize)]
+pub struct GetPublishedFileDetailsResponseInner {
+    pub publishedfiledetails: Vec<PublishedFileDetails>,
+}
+
+#[derive(Deserialize)]
+pub struct PublishedFileDetails {
+    pub publishedfileid: String,
+    pub title: String,
+    /// ctime
+    pub time_updated: i64,
+    pub children: Option<Vec<PublishedFileChild>>,
+}
+
+#[derive(Deserialize)]
+pub struct PublishedFileChild {
+    pub publishedfileid: String,
 }

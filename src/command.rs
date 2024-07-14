@@ -1,6 +1,7 @@
-use std::{io::{Cursor, BufRead, BufReader, Read}, path::{PathBuf, Path}, sync::mpsc::{self, TryRecvError}, ffi::OsStr, thread::{JoinHandle, self}, time::Duration, collections::HashMap};
+use std::{collections::{HashMap, HashSet}, ffi::OsStr, io::{BufRead, BufReader, Cursor, Read}, path::{Path, PathBuf}, sync::mpsc::{self, TryRecvError}, thread::{self, JoinHandle}, time::Duration};
 
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use curl::easy::Easy;
 use fs_extra::dir::CopyOptions;
 use log::{trace, error, warn};
@@ -8,7 +9,7 @@ use ring::digest;
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
-use crate::{error::{Result, Error}, schemas::{Descriptor, Config}};
+use crate::{error::{Error, Result}, schemas::{Config, Descriptor, PublishedFileDetails}, steam_webapi_client::SteamWebApiClient};
 
 pub fn install_irony() -> Result<()> {
     let url = "https://github.com/bcssov/IronyModManager/releases/latest/download/win-x64.zip";
@@ -84,6 +85,16 @@ pub fn get_local_descriptors() -> Result<HashMap<String, Descriptor>> {
     }).collect())
 }
 
+pub fn get_local_created_timestamp(id: impl AsRef<str>) -> Result<Option<DateTime<Utc>>> {
+    let mut local_dir = get_collection_dir()?;
+    local_dir.push(id.as_ref());
+    if local_dir.is_dir() {
+        Ok(Some(local_dir.metadata()?.created()?.into()))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn download_workshop_item(workshop_item_id: impl AsRef<str>) -> Result<WorkerProcess> {
     ensure_init()?;
     let stellaris_appid = "281990";
@@ -147,11 +158,45 @@ pub fn get_config_or_default() -> Result<Config> {
     if !config_file.exists() {
         let default = Config {
             collection_path: "mods".to_owned(),
+            steam_webapi_key: String::new(),
         };
         warn!("Config file does not exist, creating default at {}", config_file.display());
         std::fs::write(&config_file, toml::to_string_pretty(&default)?)?;
     }
-    Ok(toml::from_str::<Config>(&std::fs::read_to_string(&config_file)?)?)
+
+    let config = toml::from_str::<Config>(&std::fs::read_to_string(&config_file)?)?;
+    // Abort if webapi key is blank
+    if !config.steam_webapi_key.is_empty(){
+        Ok(config)
+    } else {
+        error!("Empty steam webapi key in config file, acquire one from https://steamcommunity.com/dev/apikey");
+        Err(Error::MissingWebApiKey())
+    }
+}
+
+/// Given a list of workshop file ids, fetch all details for files including dependencies
+pub async fn fetch_workshop_details_with_dependencies(webapi_client: &SteamWebApiClient, file_ids: HashSet<String>) -> Result<HashMap<String, PublishedFileDetails>> {
+    let mut cached_file_details = HashMap::new();
+    let mut new_file_ids = file_ids;
+    loop {
+        if new_file_ids.is_empty() {
+            break;
+        }
+
+        let new_file_details = webapi_client.get_published_file_details(new_file_ids.iter()).await?;
+
+        // extract all currently uncached child ids from the new file details
+        new_file_ids = new_file_details.values()
+            .filter(|d| d.children.is_some())
+            .flat_map(|d| d.children.as_ref().unwrap())
+            .map(|c| c.publishedfileid.clone())
+            .filter(|id| !cached_file_details.contains_key(id))
+            .collect::<HashSet<_>>();
+
+        // append new file details into cache
+        cached_file_details.extend(new_file_details.into_iter());
+    }
+    Ok(cached_file_details)
 }
 
 fn get_root_dir() -> Result<PathBuf> {
@@ -309,7 +354,7 @@ impl WorkerProcess {
                     }
                     Ok(_) => {
                         // clean up steamcmd output
-                        let stripped = strip_ansi_escapes::strip(buf)?;
+                        let stripped = strip_ansi_escapes::strip(buf);
                         let line = String::from_utf8_lossy(&stripped);
                         let trimmed = line.trim().to_owned();
                         if !trimmed.is_empty() {

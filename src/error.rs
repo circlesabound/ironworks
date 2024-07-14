@@ -2,6 +2,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub enum Error {
+    Internal(String),
+    MissingWebApiKey(),
     NotInitialised(),
     WorkerExitCode(u32),
     Conpty(conpty::error::Error),
@@ -9,6 +11,7 @@ pub enum Error {
     FsExtra(fs_extra::error::Error),
     Io(std::io::Error),
     Jomini(jomini::Error),
+    Reqwest(reqwest::Error),
     TomlDe(toml::de::Error),
     TomlSer(toml::ser::Error),
     Zip(zip::result::ZipError),
@@ -49,6 +52,12 @@ impl From<std::io::Error> for Error {
 impl From<jomini::Error> for Error {
     fn from(value: jomini::Error) -> Self {
         Error::Jomini(value)
+    }
+}
+
+impl From<reqwest::Error> for Error {
+    fn from(value: reqwest::Error) -> Self {
+        Error::Reqwest(value)
     }
 }
 
